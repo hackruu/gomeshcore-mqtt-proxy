@@ -13,7 +13,7 @@ The proxy can be use transparently on the local network. Devices continue talkin
 ## How it works
 
 ```
-MeshCore node (TCP :1883, meshcore:meshcore)
+MeshCore node (TCP :1883, optional login:password checking)
     │
     ▼
 [gomeshcore-mqtt-proxy]
