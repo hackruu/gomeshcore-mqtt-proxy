@@ -103,7 +103,7 @@ This means the proxy must hold the private key of each node it forwards on behal
 
 > **If a node's private key is leaked, anyone who obtains it can impersonate that node on the MeshCore network** — connecting to community brokers, publishing telemetry under its identity, and potentially claiming ownership. Treat `MESHCORE_KEY_N_PRIVATE` values with the same care as passwords. Do not commit them to version control, do not share them, and restrict access to the machine running this proxy.
 
-## iptables redirect
+### iptables redirect
 
 To transparently intercept device traffic destined for the real broker:
 
@@ -112,11 +112,10 @@ To transparently intercept device traffic destined for the real broker:
 iptables -t nat -A PREROUTING \
   -s <device_ip> -d <real_broker_ip> -p tcp --dport 1883 \
   -j DNAT --to-destination <proxy_ip>:1883
-  ```
 
 # Enable forwarding
 echo 1 > /proc/sys/net/ipv4/ip_forward
-
+```
 
 ## AI usage
 Built with help of AI tooling.
