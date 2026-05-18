@@ -1,0 +1,12 @@
+services:
+  mqtt-proxy:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+    env_file: .env
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
