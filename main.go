@@ -16,6 +16,8 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+
+	"golang.org/x/sync/singleflight"
 	"time"
 
 	pahov3 "github.com/eclipse/paho.mqtt.golang"
@@ -460,8 +462,9 @@ type nodePair struct {
 // NodeRegistry creates and caches per-node WS connections on first use.
 type NodeRegistry struct {
 	keys      map[string]KeyEntry  // pubkey_hex_upper → KeyEntry
-	nodes     map[string]*nodePair // pubkey_hex_upper → active pair
+	nodes     map[string]*nodePair // pubkey_hex_upper → active pair (only after connections ready)
 	mu        sync.RWMutex
+	sf        singleflight.Group
 	wsURLs    []string
 	lifetime  int64
 	clientStr string
@@ -479,12 +482,13 @@ func newNodeRegistry(keys map[string]KeyEntry, wsURLs []string, lifetime int64, 
 	}
 }
 
-// getOrCreate returns the cached nodePair for pubkeyHex, creating WS connections
-// on first call. Blocks until the new connections are established so the first
-// publish is not dropped while the dial is in progress.
+// getOrCreate returns the nodePair for pubkeyHex, creating WS connections on first call.
+// The pair is stored in the map only after all connections are established, so the fast
+// path never returns an unready pair. singleflight ensures concurrent callers for the
+// same node block together and share the result rather than racing to create duplicates.
 // Returns nil if pubkeyHex is not in the known-keys dictionary.
 func (r *NodeRegistry) getOrCreate(pubkeyHex string) *nodePair {
-	// Fast path.
+	// Fast path — pair is present only after connections are ready.
 	r.mu.RLock()
 	pair, ok := r.nodes[pubkeyHex]
 	r.mu.RUnlock()
@@ -492,47 +496,56 @@ func (r *NodeRegistry) getOrCreate(pubkeyHex string) *nodePair {
 		return pair
 	}
 
-	// Slow path — check registry and create.
-	r.mu.Lock()
+	// Slow path — exactly one goroutine does the work; all concurrent callers
+	// for the same node block here and receive the same result.
+	v, _, _ := r.sf.Do(pubkeyHex, func() (interface{}, error) {
+		// Re-check: a previous flight may have stored the pair already.
+		r.mu.RLock()
+		if pair, ok := r.nodes[pubkeyHex]; ok {
+			r.mu.RUnlock()
+			return pair, nil
+		}
+		r.mu.RUnlock()
 
-	// Double-check after acquiring write lock.
-	if pair, ok = r.nodes[pubkeyHex]; ok {
-		r.mu.Unlock()
-		return pair
-	}
+		entry, known := r.keys[pubkeyHex]
+		if !known {
+			return nil, nil
+		}
 
-	entry, known := r.keys[pubkeyHex]
-	if !known {
+		shortID := pubkeyHex
+		if len(shortID) > 8 {
+			shortID = shortID[:8]
+		}
+
+		pair := &nodePair{}
+		for i, wsURL := range r.wsURLs {
+			name := fmt.Sprintf("ws-%d-%s", i, shortID)
+			if up := newWSUpstream(name, wsURL, entry.PrivKey, entry.PubKey, entry.Email, r.clientStr, r.lifetime, r.logger); up != nil {
+				pair.ws = append(pair.ws, up)
+			}
+		}
+		r.logger.Info("node WS connections created", "node", pubkeyHex, "count", len(pair.ws))
+
+		// Wait before storing — guarantees fast path always returns a ready pair.
+		waitCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		for _, up := range pair.ws {
+			if err := up.cm.AwaitConnection(waitCtx); err != nil {
+				r.logger.Warn("WS upstream did not connect in time for first publish", "upstream", up.nm, "err", err)
+			}
+		}
+
+		r.mu.Lock()
+		r.nodes[pubkeyHex] = pair
 		r.mu.Unlock()
+
+		return pair, nil
+	})
+
+	if v == nil {
 		return nil
 	}
-
-	shortID := pubkeyHex
-	if len(shortID) > 8 {
-		shortID = shortID[:8]
-	}
-
-	pair = &nodePair{}
-	for i, wsURL := range r.wsURLs {
-		name := fmt.Sprintf("ws-%d-%s", i, shortID)
-		if up := newWSUpstream(name, wsURL, entry.PrivKey, entry.PubKey, entry.Email, r.clientStr, r.lifetime, r.logger); up != nil {
-			pair.ws = append(pair.ws, up)
-		}
-	}
-	r.nodes[pubkeyHex] = pair
-	r.logger.Info("node WS connections created", "node", pubkeyHex, "count", len(pair.ws))
-	r.mu.Unlock() // release before blocking on dial
-
-	// Wait for all connections to come up before returning so the caller's
-	// first forward() call doesn't hit "connection currently down".
-	waitCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	for _, up := range pair.ws {
-		if err := up.cm.AwaitConnection(waitCtx); err != nil {
-			r.logger.Warn("WS upstream did not connect in time for first publish", "upstream", up.nm, "err", err)
-		}
-	}
-	return pair
+	return v.(*nodePair)
 }
 
 func (r *NodeRegistry) shutdownAll() {
